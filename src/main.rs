@@ -1,10 +1,14 @@
-use reqwest::Error;
+//use reqwest::Error;
 use serde::Deserialize;
+use plotters::prelude::*;
 use std::env;
 use std::fmt;
+use std::fs;
+use std::path::Path;
 
 const BASEURL: &str = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/name/";
 const RETURNTYPE: &str = "/JSON";
+const PNGDIR: &str = "png_out/";
 
 #[derive(Debug, Deserialize)]
 struct AtomInfo {
@@ -82,7 +86,7 @@ struct IUPACName {
 struct Compound {
     cid: Option<u32>,
     atoms: Option<AtomInfo>,
-    bonds: Option<BondInfo>,
+    bonds: Option<Vec<BondInfo>>,
     coords: Option<Vec<Coords>>,
     props: Option<Vec<Props>>,
     stereo: Option<Vec<Stereo>>,
@@ -210,11 +214,47 @@ impl fmt::Display for Compound {
     }
 }
 
+fn plot_molecule(name: &str, coords: &[Coords], bonds: &[BondInfo]) -> Result<(), Box<dyn std::error::Error>> {
+    let png_name = format!("{}{}.png", PNGDIR, name);
+    let root = BitMapBackend::new(&png_name, (800, 600)).into_drawing_area();
+    root.fill(&WHITE)?;
+    let mut chart = ChartBuilder::on(&root)
+        .caption(name, ("sans-serif", 50).into_font())
+        .margin(20)
+        .x_label_area_size(40)
+        .y_label_area_size(40)
+        .build_cartesian_2d(0f64..10f64, 0f64..10f64)?;
+    chart.configure_mesh().draw()?;
+    if let Some(conformer) = coords.get(0).and_then(|c| c.conformers.get(0)) {
+        for bond in bonds {
+            for i in 0..bond.aid1.len() {
+                let atom1_idx = bond.aid1[i] as usize;
+                let atom2_idx = bond.aid2[i] as usize;
+                chart.draw_series(LineSeries::new(
+                    vec![
+                        (conformer.x[atom1_idx], conformer.y[atom1_idx]),
+                        (conformer.x[atom2_idx], conformer.y[atom2_idx]),
+                    ],
+                    &RED,
+                ))?;
+            }
+        }
+    } else {
+        eprintln!("No conformers available for plotting.");
+    }
+    
+    Ok(())
+}
+
 #[tokio::main]
-async fn main() -> Result<(), Error> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let path = Path::new(PNGDIR);
+    if !path.exists() {
+        fs::create_dir_all(path)?;
+    }
     let args: Vec<String> = env::args().collect();
     if args.len() < 2 {
-        eprintln!("\nmain() :: ERROR -> Please enter compound names (in alphabetical characters) as arguments to cargo run");
+        println!("src/main.rs usage :: cargo run <compound_name> <compound_name> <compound_name> ... (at least one additional argument)");
         return Ok(());
     }
     let names: Vec<String> = args.into_iter()
@@ -228,22 +268,12 @@ async fn main() -> Result<(), Error> {
     for name in &names {
         let url = format!("{}{}{}", BASEURL, name, RETURNTYPE);
         let response = reqwest::get(&url).await?;
-        let status = response.status();
-        if status.is_success() {
-            println!("\nmain() :: Successfully requested PubChem PUG REST API\n\nStatus: {}\n", status);
-            let json: serde_json::Value = response.json().await?;
-            //println!("\nmain() :: Raw JSON response\n\n{}\n", json);
-            if let Some(compounds) = json["PC_Compounds"].as_array() {
-                for compound in compounds {
-                    if let Ok(compound) = serde_json::from_value::<Compound>(compound.clone()) {
-                        println!("{}", compound);
-                    }
-                }
-            } else {
-                eprintln!("\nmain() :: ERROR -> Could not find any compound using query name '{}'; or parsing error potentially occurred\n\nStatus: {}\n", name, status);
+        let compound: Compound = response.json().await?;
+        println!("{}", compound);
+        if let Some(coords) = compound.coords {
+            if let Some(bonds) = compound.bonds {
+                plot_molecule(name, &coords, &bonds)?;
             }
-        } else {
-            eprintln!("\nmain() :: ERROR -> Failed to fetch compound using query name '{}'\n\nStatus: {}\n", name, status);
         }
     }
     Ok(())
